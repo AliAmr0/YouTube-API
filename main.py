@@ -51,7 +51,26 @@ def validate_youtube_url(url: str) -> bool:
         r'(https?://)?(www\.)?(youtube|youtu|youtube-nocookie)\.(com|be)/'
         r'(watch\?v=|embed/|v/|.+\?v=)?([^&=%\?]{11})'
     )
-    return bool(youtube_regex.match(url))
+    
+    # Also check for youtu.be short URLs
+    youtu_be_regex = re.compile(
+        r'(https?://)?(www\.)?youtu\.be/([^&=%\?]{11})'
+    )
+    
+    return bool(youtube_regex.match(url) or youtu_be_regex.match(url))
+
+def normalize_youtube_url(url: str) -> str:
+    """Normalize YouTube URL to standard format"""
+    # Handle youtu.be URLs
+    if 'youtu.be' in url:
+        video_id = url.split('/')[-1].split('?')[0]
+        return f"https://www.youtube.com/watch?v={video_id}"
+    
+    # Handle other formats
+    if 'youtube.com' in url and 'v=' in url:
+        return url
+    
+    return url
 
 def extract_video_info(url: str) -> Dict[str, Any]:
     """Extract video information using yt-dlp"""
@@ -62,15 +81,33 @@ def extract_video_info(url: str) -> Dict[str, Any]:
         'audioformat': 'mp3',
         'outtmpl': '%(title)s.%(ext)s',
         'ignoreerrors': True,
+        'extractor_args': {
+            'youtube': {
+                'skip': ['dash', 'hls'],
+                'player_client': ['android', 'web']
+            }
+        }
     }
     
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
+            if info is None:
+                raise HTTPException(status_code=400, detail="Could not extract video information. Video may be private, deleted, or require sign-in.")
             return info
+    except yt_dlp.utils.DownloadError as e:
+        error_msg = str(e)
+        if "Sign in to confirm you're not a bot" in error_msg:
+            raise HTTPException(status_code=403, detail="This video requires sign-in verification. Please try a different video.")
+        elif "Private video" in error_msg:
+            raise HTTPException(status_code=403, detail="This video is private and cannot be accessed.")
+        elif "Video unavailable" in error_msg:
+            raise HTTPException(status_code=404, detail="This video is unavailable or has been deleted.")
+        else:
+            raise HTTPException(status_code=400, detail=f"Error extracting video info: {error_msg}")
     except Exception as e:
         logger.error(f"Error extracting video info: {str(e)}")
-        raise HTTPException(status_code=400, detail=f"Error extracting video info: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error while processing video.")
 
 def get_download_formats(info: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Extract available download formats"""
@@ -103,6 +140,7 @@ async def root():
         "endpoints": {
             "/video/info": "Get video information",
             "/video/download": "Get video download links",
+            "/video/status": "Check video accessibility status",
             "/playlist/info": "Get playlist information",
             "/playlist/download": "Get playlist download links",
             "/health": "Health check endpoint"
@@ -124,14 +162,18 @@ async def get_video_info(
     if not validate_youtube_url(url):
         raise HTTPException(status_code=400, detail="Invalid YouTube URL")
     
+    # Normalize URL
+    url = normalize_youtube_url(url)
+    
     try:
         # Run in thread pool to avoid blocking
         loop = asyncio.get_event_loop()
         info = await loop.run_in_executor(executor, extract_video_info, url)
         
+        # Safely extract video information
         video_info = {
-            "id": info.get("id"),
-            "title": info.get("title"),
+            "id": info.get("id", "Unknown ID"),
+            "title": info.get("title", "Unknown Title"),
             "description": info.get("description"),
             "duration": info.get("duration"),
             "view_count": info.get("view_count"),
@@ -142,7 +184,7 @@ async def get_video_info(
             "tags": info.get("tags", []),
             "categories": info.get("categories", []),
             "age_limit": info.get("age_limit"),
-            "webpage_url": info.get("webpage_url")
+            "webpage_url": info.get("webpage_url", url)
         }
         
         if include_formats:
@@ -150,9 +192,97 @@ async def get_video_info(
         
         return video_info
         
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
     except Exception as e:
         logger.error(f"Error getting video info: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error getting video info: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error while processing video information.")
+
+@app.get("/video/status")
+async def check_video_status(
+    url: str = Query(..., description="YouTube video URL")
+):
+    """Check if a YouTube video is accessible and get basic status"""
+    
+    if not validate_youtube_url(url):
+        raise HTTPException(status_code=400, detail="Invalid YouTube URL")
+    
+    # Normalize URL
+    url = normalize_youtube_url(url)
+    
+    try:
+        ydl_opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'skip_download': True,
+            'extract_flat': True,
+            'ignoreerrors': True,
+            'extractor_args': {
+                'youtube': {
+                    'skip': ['dash', 'hls'],
+                    'player_client': ['android', 'web']
+                }
+            }
+        }
+        
+        loop = asyncio.get_event_loop()
+        
+        def check_status():
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(url, download=False)
+                    if info is None:
+                        return {
+                            "accessible": False,
+                            "status": "unavailable",
+                            "message": "Video is not accessible"
+                        }
+                    return {
+                        "accessible": True,
+                        "status": "available",
+                        "message": "Video is accessible",
+                        "title": info.get("title", "Unknown Title"),
+                        "uploader": info.get("uploader"),
+                        "duration": info.get("duration")
+                    }
+            except yt_dlp.utils.DownloadError as e:
+                error_msg = str(e)
+                if "Sign in to confirm you're not a bot" in error_msg:
+                    return {
+                        "accessible": False,
+                        "status": "restricted",
+                        "message": "Video requires sign-in verification"
+                    }
+                elif "Private video" in error_msg:
+                    return {
+                        "accessible": False,
+                        "status": "private",
+                        "message": "Video is private"
+                    }
+                elif "Video unavailable" in error_msg:
+                    return {
+                        "accessible": False,
+                        "status": "unavailable",
+                        "message": "Video is unavailable or deleted"
+                    }
+                else:
+                    return {
+                        "accessible": False,
+                        "status": "error",
+                        "message": f"Error accessing video: {error_msg}"
+                    }
+        
+        result = await loop.run_in_executor(executor, check_status)
+        return result
+        
+    except Exception as e:
+        logger.error(f"Error checking video status: {str(e)}")
+        return {
+            "accessible": False,
+            "status": "error",
+            "message": "Internal server error while checking video status"
+        }
 
 @app.get("/video/download")
 async def get_video_download_links(
@@ -168,6 +298,9 @@ async def get_video_download_links(
     if quality not in QUALITY_OPTIONS:
         raise HTTPException(status_code=400, detail="Invalid quality option")
     
+    # Normalize URL
+    url = normalize_youtube_url(url)
+    
     try:
         # Configure yt-dlp options based on quality and format
         ydl_opts = {
@@ -175,6 +308,12 @@ async def get_video_download_links(
             'no_warnings': True,
             'format': QUALITY_OPTIONS[quality],
             'ignoreerrors': True,
+            'extractor_args': {
+                'youtube': {
+                    'skip': ['dash', 'hls'],
+                    'player_client': ['android', 'web']
+                }
+            }
         }
         
         if format == "mp3":
@@ -190,16 +329,29 @@ async def get_video_download_links(
         loop = asyncio.get_event_loop()
         
         def get_download_info():
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=False)
-                return info
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(url, download=False)
+                    if info is None:
+                        raise HTTPException(status_code=400, detail="Could not extract video information. Video may be private, deleted, or require sign-in.")
+                    return info
+            except yt_dlp.utils.DownloadError as e:
+                error_msg = str(e)
+                if "Sign in to confirm you're not a bot" in error_msg:
+                    raise HTTPException(status_code=403, detail="This video requires sign-in verification. Please try a different video.")
+                elif "Private video" in error_msg:
+                    raise HTTPException(status_code=403, detail="This video is private and cannot be accessed.")
+                elif "Video unavailable" in error_msg:
+                    raise HTTPException(status_code=404, detail="This video is unavailable or has been deleted.")
+                else:
+                    raise HTTPException(status_code=400, detail=f"Error extracting video: {error_msg}")
         
         info = await loop.run_in_executor(executor, get_download_info)
         
-        # Extract download information
+        # Safely extract download information
         download_info = {
-            "title": info.get("title"),
-            "id": info.get("id"),
+            "title": info.get("title", "Unknown Title"),
+            "id": info.get("id", "Unknown ID"),
             "duration": info.get("duration"),
             "filesize": info.get("filesize"),
             "ext": info.get("ext"),
@@ -210,11 +362,18 @@ async def get_video_download_links(
             "thumbnail": info.get("thumbnail")
         }
         
+        # Validate that we have a download URL
+        if not download_info["download_url"]:
+            raise HTTPException(status_code=503, detail="Unable to generate download link. The video may be protected or unavailable.")
+        
         return download_info
         
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
     except Exception as e:
         logger.error(f"Error getting download links: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error getting download links: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error while processing download request.")
 
 @app.get("/playlist/info")
 async def get_playlist_info(
